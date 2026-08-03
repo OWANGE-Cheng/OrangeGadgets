@@ -1,0 +1,4 @@
+PyMuPDF>=1.24
+Pillow>=10.0
+tkinterdnd2>=0.4.3
+pywin32>=306; sys_platform == "win32"

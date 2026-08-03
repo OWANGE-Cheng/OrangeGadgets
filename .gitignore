@@ -27,3 +27,7 @@ Desktop.ini
 
 # PyInstaller
 *.spec
+
+# Generated verification and output files
+tmp/
+output/
