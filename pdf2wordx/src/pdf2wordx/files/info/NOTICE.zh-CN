@@ -1,0 +1,13 @@
+开源许可与致谢
+
+PDF2WORDX 原作者：Tutos Rive（SRM / TRG）
+上游项目：https://github.com/tutosrive/pdf2wordx/
+上游版本：2.1.1
+上游许可证：MIT（完整文本见本工具目录中的 LICENSE）
+
+本简体中文版本由 OrangeGadgets 在上游源代码基础上完成界面、提示信息和帮助文档翻译，并进行了作为子工具运行所需的路径兼容性调整。OrangeGadgets 仅负责翻译与集成，不是 PDF2WORDX 的原作者。
+
+本项目使用 ArtifexSoftware 提供的 pdf2docx 完成 PDF 到 DOCX 的转换。感谢 pdf2docx 团队的工作；若无该库，本工具无法提供可靠、免费的本地转换功能。
+
+pdf2docx 项目：https://github.com/ArtifexSoftware/pdf2docx
+pdf2docx 的许可条件以其上游发布内容为准。

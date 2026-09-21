@@ -1,0 +1,4 @@
+include src/pdf2wordx/*.ico
+recursive-include src/pdf2wordx/files *
+include LICENSE
+include TRANSLATION_NOTICE.md
