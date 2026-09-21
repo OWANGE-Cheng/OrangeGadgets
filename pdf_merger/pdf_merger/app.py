@@ -49,6 +49,7 @@ THEMES = {
         "thumb": "#E3E7EC",
         "text": "#17202B",
         "muted": "#697586",
+        "disabled": "#929AA6",
         "border": "#D7DCE3",
         "accent": "#EC6A22",
         "accent_hover": "#D95612",
@@ -66,6 +67,7 @@ THEMES = {
         "thumb": "#303743",
         "text": "#F2F4F7",
         "muted": "#A8B0BD",
+        "disabled": "#7E8795",
         "border": "#343B47",
         "accent": "#FF7A2E",
         "accent_hover": "#FF9257",
@@ -148,12 +150,31 @@ class LayoutUnit:
 @dataclass(slots=True)
 class DragState:
     unit: LayoutUnit
+    page_ids: list[str]
     start_x: float
     start_y: float
     current_x: float
     current_y: float
     active: bool = False
     insert_index: int = 0
+    collapse_on_release: bool = False
+
+
+@dataclass(slots=True)
+class SelectionBoxState:
+    start_x: float
+    start_y: float
+    current_x: float
+    current_y: float
+    base_page_ids: list[str]
+    additive: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EditSnapshot:
+    pages: tuple[PageRef, ...]
+    expanded_sources: frozenset[str]
+    selected_page_ids: tuple[str, ...]
 
 
 class PdfMergerApp:
@@ -176,14 +197,22 @@ class PdfMergerApp:
         self.units: list[LayoutUnit] = []
         self.unit_by_id: dict[str, LayoutUnit] = {}
         self.selected_page_ids: list[str] = []
+        self.selection_anchor_id: str | None = None
         self.hover_unit_id: str | None = None
         self.drag: DragState | None = None
+        self.selection_box: SelectionBoxState | None = None
+        self.undo_stack: list[EditSnapshot] = []
+        self.redo_stack: list[EditSnapshot] = []
+        self.clipboard_pages: list[PageRef] = []
         self.busy = False
         self.pending_conversions = 0
         self.render_job: str | None = None
         self.queue_job: str | None = None
         self.thumbnail_images: dict[tuple[str, int], Image.Image] = {}
-        self.thumbnail_photos: dict[tuple[str, int], ImageTk.PhotoImage] = {}
+        # Canvas image items only keep a weak Tcl-side reference.  Keep one
+        # PhotoImage per visible card so duplicate pages cannot invalidate one
+        # another by overwriting a shared (source, page) cache entry.
+        self.thumbnail_photos: dict[str, ImageTk.PhotoImage] = {}
         self.thumbnail_pending: set[tuple[str, int]] = set()
         self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="pdf-merger")
         self.ui_queue: queue.Queue[tuple[object, tuple[object, ...]]] = queue.Queue()
@@ -344,7 +373,7 @@ class PdfMergerApp:
         self.summary_label.pack(side="left", padx=(9, 0))
         self.hint_label = ttk.Label(
             work_header,
-            text="悬停显示删除操作  ·  鼠标滚轮纵向浏览",
+            text="拖动框选  ·  Ctrl / Shift 多选  ·  Ctrl+Z 撤销",
             style="Meta.TLabel",
         )
         self.hint_label.pack(side="right")
@@ -385,8 +414,33 @@ class PdfMergerApp:
         self.workspace.bind("<B1-Motion>", self._on_drag_motion)
         self.workspace.bind("<ButtonRelease-1>", self._on_release)
         self.workspace.bind("<MouseWheel>", self._on_mousewheel)
+        self.workspace.bind("<Button-3>", self._show_context_menu)
         self.root.bind("<Control-o>", lambda _event: self._choose_files())
-        self.root.bind("<Delete>", lambda _event: self._delete_selected())
+        self.root.bind("<Control-s>", lambda _event: self._export())
+        self.root.bind("<Control-a>", self._select_all)
+        self.root.bind("<Control-A>", self._select_all)
+        self.root.bind("<Control-z>", self._undo)
+        self.root.bind("<Control-Z>", self._undo)
+        self.root.bind("<Control-y>", self._redo)
+        self.root.bind("<Control-Y>", self._redo)
+        self.root.bind("<Control-Shift-z>", self._redo)
+        self.root.bind("<Control-Shift-Z>", self._redo)
+        self.root.bind("<Control-c>", self._copy_selected)
+        self.root.bind("<Control-C>", self._copy_selected)
+        self.root.bind("<Control-x>", self._cut_selected)
+        self.root.bind("<Control-X>", self._cut_selected)
+        self.root.bind("<Control-v>", self._paste_pages)
+        self.root.bind("<Control-V>", self._paste_pages)
+        self.root.bind("<Delete>", self._delete_selected)
+        self.root.bind("<BackSpace>", self._delete_selected)
+        self.root.bind("<Escape>", self._clear_selection)
+        self.root.bind("<Home>", lambda event: self._select_edge(event, first=True))
+        self.root.bind("<End>", lambda event: self._select_edge(event, first=False))
+        self.root.bind("<Left>", lambda event: self._navigate_selection(event, "left"))
+        self.root.bind("<Right>", lambda event: self._navigate_selection(event, "right"))
+        self.root.bind("<Up>", lambda event: self._navigate_selection(event, "up"))
+        self.root.bind("<Down>", lambda event: self._navigate_selection(event, "down"))
+        self.root.bind("<Return>", self._toggle_selected_groups)
         self.root.bind("<Control-d>", lambda _event: self._toggle_theme())
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -395,6 +449,201 @@ class PdfMergerApp:
         self.startup_theme = self.theme_name
         self._save_startup_theme()
         self._apply_theme()
+
+    def _snapshot(self) -> EditSnapshot:
+        return EditSnapshot(
+            pages=tuple(self.pages),
+            expanded_sources=frozenset(self.expanded_sources),
+            selected_page_ids=tuple(self.selected_page_ids),
+        )
+
+    def _record_undo(self, snapshot: EditSnapshot | None = None) -> None:
+        self.undo_stack.append(snapshot or self._snapshot())
+        if len(self.undo_stack) > 50:
+            del self.undo_stack[0]
+        self.redo_stack.clear()
+
+    def _restore_snapshot(self, snapshot: EditSnapshot) -> None:
+        self.pages = list(snapshot.pages)
+        self.expanded_sources = set(snapshot.expanded_sources)
+        active_ids = {page.uid for page in self.pages}
+        self.selected_page_ids = [uid for uid in snapshot.selected_page_ids if uid in active_ids]
+        self.selection_anchor_id = self.selected_page_ids[-1] if self.selected_page_ids else None
+        self.drag = None
+        self.selection_box = None
+        self._update_summary()
+        self._schedule_draw()
+
+    def _undo(self, _event: tk.Event | None = None) -> str:
+        if self.pending_conversions:
+            self._set_status("请等待 Word 文档转换完成后再撤销。")
+            return "break"
+        if self.busy or not self.undo_stack:
+            return "break"
+        self.redo_stack.append(self._snapshot())
+        self._restore_snapshot(self.undo_stack.pop())
+        self._set_status("已撤销上一步操作。")
+        return "break"
+
+    def _redo(self, _event: tk.Event | None = None) -> str:
+        if self.pending_conversions:
+            self._set_status("请等待 Word 文档转换完成后再重做。")
+            return "break"
+        if self.busy or not self.redo_stack:
+            return "break"
+        self.undo_stack.append(self._snapshot())
+        self._restore_snapshot(self.redo_stack.pop())
+        self._set_status("已重做上一步操作。")
+        return "break"
+
+    def _select_all(self, _event: tk.Event | None = None) -> str:
+        self.selected_page_ids = [page.uid for page in self.pages]
+        self.selection_anchor_id = self.selected_page_ids[-1] if self.selected_page_ids else None
+        self._set_status(f"已选择全部 {len(self.pages)} 页。")
+        self._schedule_draw()
+        return "break"
+
+    def _clear_selection(self, _event: tk.Event | None = None) -> str:
+        self.selected_page_ids.clear()
+        self.selection_anchor_id = None
+        self.drag = None
+        self.selection_box = None
+        self._schedule_draw()
+        return "break"
+
+    def _copy_selected(self, _event: tk.Event | None = None) -> str:
+        selected = set(self.selected_page_ids)
+        self.clipboard_pages = [page for page in self.pages if page.uid in selected]
+        if self.clipboard_pages:
+            self._set_status(f"已复制 {len(self.clipboard_pages)} 页。")
+        return "break"
+
+    def _cut_selected(self, _event: tk.Event | None = None) -> str:
+        if not self.selected_page_ids:
+            return "break"
+        self._copy_selected()
+        self._delete_selected()
+        self._set_status(f"已剪切 {len(self.clipboard_pages)} 页，可按 Ctrl+V 粘贴。")
+        return "break"
+
+    def _paste_pages(self, _event: tk.Event | None = None) -> str:
+        if self.busy or not self.clipboard_pages:
+            return "break"
+        clipboard_sources = {
+            page.source_id for page in self.clipboard_pages if page.source_id in self.sources
+        }
+        if any(self.sources[source_id].converting for source_id in clipboard_sources):
+            self._set_status("请等待 Word 文档转换完成后再粘贴。")
+            return "break"
+
+        before_paste = self._snapshot()
+        selected = set(self.selected_page_ids)
+        selected_positions = [index for index, page in enumerate(self.pages) if page.uid in selected]
+        insert_at = max(selected_positions) + 1 if selected_positions else len(self.pages)
+        pasted: list[PageRef] = []
+        previous_source_id: str | None = None
+        pasted_source_id: str | None = None
+        for page in self.clipboard_pages:
+            source = self.sources.get(page.source_id)
+            if source is None:
+                continue
+            if page.source_id != previous_source_id:
+                pasted_source_id = uuid.uuid4().hex
+                self.sources[pasted_source_id] = SourceModel(
+                    uid=pasted_source_id,
+                    path=source.path,
+                    kind=source.kind,
+                    page_count=source.page_count,
+                    prepared_pdf=source.prepared_pdf,
+                    converting=False,
+                    error=source.error,
+                )
+                previous_source_id = page.source_id
+            pasted.append(
+                PageRef(uuid.uuid4().hex, pasted_source_id, page.page_index, page.width, page.height)
+            )
+        if not pasted:
+            return "break"
+
+        self.pages[insert_at:insert_at] = pasted
+        self.selected_page_ids = [page.uid for page in pasted]
+        self.selection_anchor_id = self.selected_page_ids[-1] if self.selected_page_ids else None
+        self._record_undo(before_paste)
+        self._update_summary()
+        self._schedule_draw()
+        self._set_status(f"已粘贴 {len(pasted)} 页。")
+        return "break"
+
+    def _select_edge(self, event: tk.Event, *, first: bool) -> str:
+        if not self.units:
+            return "break"
+        target = self.units[0] if first else self.units[-1]
+        self._select_unit_with_modifiers(target, event.state)
+        self._scroll_unit_into_view(target)
+        return "break"
+
+    def _navigate_selection(self, event: tk.Event, direction: str) -> str:
+        if not self.units:
+            return "break"
+        selected = set(self.selected_page_ids)
+        current = next(
+            (unit for unit in reversed(self.units) if set(unit.page_ids).issubset(selected)),
+            self.units[0],
+        )
+        current_index = self.units.index(current)
+        if direction == "left":
+            target = self.units[max(0, current_index - 1)]
+        elif direction == "right":
+            target = self.units[min(len(self.units) - 1, current_index + 1)]
+        else:
+            candidates = [
+                unit
+                for unit in self.units
+                if (unit.center_y < current.center_y if direction == "up" else unit.center_y > current.center_y)
+            ]
+            if not candidates:
+                target = current
+            else:
+                target = min(
+                    candidates,
+                    key=lambda unit: (abs(unit.center_y - current.center_y), abs(unit.center_x - current.center_x)),
+                )
+        self._select_unit_with_modifiers(target, event.state)
+        self._scroll_unit_into_view(target)
+        return "break"
+
+    def _scroll_unit_into_view(self, unit: LayoutUnit) -> None:
+        region = self.workspace.cget("scrollregion").split()
+        if len(region) != 4:
+            return
+        total_height = max(1.0, float(region[3]) - float(region[1]))
+        top = self.workspace.canvasy(0)
+        bottom = top + self.workspace.winfo_height()
+        if unit.y1 < top:
+            self.workspace.yview_moveto(max(0.0, unit.y1 / total_height))
+        elif unit.y2 > bottom:
+            self.workspace.yview_moveto(max(0.0, (unit.y2 - self.workspace.winfo_height()) / total_height))
+        self._schedule_draw()
+
+    def _toggle_selected_groups(self, _event: tk.Event | None = None) -> str:
+        selected = set(self.selected_page_ids)
+        source_ids = {
+            unit.source_id
+            for unit in self.units
+            if set(unit.page_ids).issubset(selected) and len(unit.page_ids) > 1
+        }
+        if not source_ids:
+            return "break"
+        self._record_undo()
+        for source_id in source_ids:
+            if source_id in self.expanded_sources:
+                self.expanded_sources.remove(source_id)
+            else:
+                self.expanded_sources.add(source_id)
+        self.selected_page_ids.clear()
+        self.selection_anchor_id = None
+        self._schedule_draw()
+        return "break"
 
     @staticmethod
     def _config_path() -> Path:
@@ -531,7 +780,9 @@ class PdfMergerApp:
         return "break"
 
     def _add_paths(self, paths: tuple[str, ...] | list[str]) -> None:
-        existing = {source.path for source in self.sources.values()}
+        before_add = self._snapshot()
+        active_source_ids = {page.source_id for page in self.pages}
+        existing = {self.sources[source_id].path for source_id in active_source_ids if source_id in self.sources}
         errors: list[str] = []
         added = 0
         for raw_path in paths:
@@ -572,6 +823,7 @@ class PdfMergerApp:
                 self._start_document_conversion(source)
 
         if added:
+            self._record_undo(before_add)
             self._set_status(f"已添加 {added} 个文件。拖动卡片即可调整合并顺序。")
             self._update_summary()
             self._schedule_draw()
@@ -644,10 +896,11 @@ class PdfMergerApp:
             messagebox.showerror("Word 文档转换失败", str(exc), parent=self.root)
         else:
             placeholder_positions = [index for index, page in enumerate(self.pages) if page.source_id == source_id]
-            insert_at = placeholder_positions[0] if placeholder_positions else len(self.pages)
-            self.pages = [page for page in self.pages if page.source_id != source_id]
-            new_pages = self._make_pages(source_id, page_count, page_sizes)
-            self.pages[insert_at:insert_at] = new_pages
+            if placeholder_positions:
+                insert_at = placeholder_positions[0]
+                self.pages = [page for page in self.pages if page.source_id != source_id]
+                new_pages = self._make_pages(source_id, page_count, page_sizes)
+                self.pages[insert_at:insert_at] = new_pages
             source.page_count = page_count
             source.prepared_pdf = output
             source.converting = False
@@ -815,6 +1068,21 @@ class PdfMergerApp:
                 font=("Microsoft YaHei UI", 9, "bold"),
                 tags=("drag_overlay",),
             )
+        if self.selection_box:
+            box = self.selection_box
+            x1, x2 = sorted((box.start_x, box.current_x))
+            y1, y2 = sorted((box.start_y, box.current_y))
+            self.workspace.create_rectangle(
+                x1,
+                y1,
+                x2,
+                y2,
+                fill=c["insert"],
+                stipple="gray25",
+                outline=c["insert"],
+                width=self._px(2),
+                tags=("selection_overlay",),
+            )
 
     def _measure_unit(self, unit: LayoutUnit) -> tuple[int, int, int, int]:
         width = max(1.0, unit.page_width)
@@ -839,7 +1107,8 @@ class PdfMergerApp:
         c = self.colors
         px = self._px
         source = self.sources[unit.source_id]
-        selected = set(unit.page_ids) == set(self.selected_page_ids) and bool(self.selected_page_ids)
+        selected_ids = set(self.selected_page_ids)
+        selected = bool(unit.page_ids) and set(unit.page_ids).issubset(selected_ids)
         hovered = unit.uid == self.hover_unit_id
         card_fill = c["card_hover"] if hovered else c["card"]
         border = c["accent"] if selected else c["border"]
@@ -904,7 +1173,7 @@ class PdfMergerApp:
                 Image.Resampling.LANCZOS,
             )
             photo = ImageTk.PhotoImage(image)
-            self.thumbnail_photos[key] = photo
+            self.thumbnail_photos[unit.uid] = photo
             self.workspace.create_image(
                 (thumb_box[0] + thumb_box[2]) / 2,
                 (thumb_box[1] + thumb_box[3]) / 2,
@@ -1062,25 +1331,71 @@ class PdfMergerApp:
         y = self.workspace.canvasy(event.y)
         unit = self._unit_at(x, y)
         if unit:
-            self.selected_page_ids = list(unit.page_ids)
-            self.drag = DragState(unit=unit, start_x=x, start_y=y, current_x=x, current_y=y)
+            selected_before = set(self.selected_page_ids)
+            unit_selected = set(unit.page_ids).issubset(selected_before)
+            has_modifier = bool(event.state & (0x0001 | 0x0004))
+            collapse_on_release = unit_selected and not has_modifier and len(selected_before) > len(unit.page_ids)
+            if not collapse_on_release:
+                self._select_unit_with_modifiers(unit, event.state)
+            if not set(unit.page_ids).issubset(self.selected_page_ids):
+                self.drag = None
+                self._schedule_draw()
+                return None
+            drag_ids = list(self.selected_page_ids)
+            self.drag = DragState(
+                unit=unit,
+                page_ids=drag_ids,
+                start_x=x,
+                start_y=y,
+                current_x=x,
+                current_y=y,
+                collapse_on_release=collapse_on_release,
+            )
             self._schedule_draw()
         else:
-            self.selected_page_ids.clear()
+            additive = bool(event.state & 0x0004)
+            base = list(self.selected_page_ids) if additive else []
+            if not additive:
+                self.selected_page_ids.clear()
+                self.selection_anchor_id = None
+            self.selection_box = SelectionBoxState(x, y, x, y, base, additive)
             self._schedule_draw()
         return None
 
     def _on_drag_motion(self, event: tk.Event) -> str | None:
-        if not self.drag or self.busy:
+        if self.busy:
             return None
         x = self.workspace.canvasx(event.x)
         y = self.workspace.canvasy(event.y)
+        if self.selection_box:
+            self.selection_box.current_x = x
+            self.selection_box.current_y = y
+            x1, x2 = sorted((self.selection_box.start_x, x))
+            y1, y2 = sorted((self.selection_box.start_y, y))
+            selected = list(self.selection_box.base_page_ids)
+            selected_set = set(selected)
+            for unit in self.units:
+                if self._rects_intersect((x1, y1, x2, y2), (unit.x1, unit.y1, unit.x2, unit.y2)):
+                    for page_id in unit.page_ids:
+                        if page_id not in selected_set:
+                            selected.append(page_id)
+                            selected_set.add(page_id)
+            self.selected_page_ids = selected
+            if event.y < self._px(38):
+                self.workspace.yview_scroll(-1, "units")
+            elif event.y > self.workspace.winfo_height() - self._px(38):
+                self.workspace.yview_scroll(1, "units")
+            self._draw_workspace()
+            return "break"
+        if not self.drag:
+            return None
         if not self.drag.active and abs(x - self.drag.start_x) + abs(y - self.drag.start_y) < self._px(7):
             return None
         self.drag.active = True
         self.drag.current_x = x
         self.drag.current_y = y
-        remaining = [unit for unit in self.units if unit.uid != self.drag.unit.uid]
+        dragged_ids = set(self.drag.page_ids)
+        remaining = [unit for unit in self.units if not set(unit.page_ids).issubset(dragged_ids)]
         self.drag.insert_index = self._find_insert_index(remaining, x, y)
         if event.y < self._px(38):
             self.workspace.yview_scroll(-1, "units")
@@ -1090,13 +1405,19 @@ class PdfMergerApp:
         return "break"
 
     def _on_release(self, _event: tk.Event) -> str | None:
+        if self.selection_box:
+            self.selection_box = None
+            self.selection_anchor_id = self.selected_page_ids[-1] if self.selected_page_ids else None
+            self._set_status(f"已选择 {len(self.selected_page_ids)} 页。")
+            self._schedule_draw()
+            return "break"
         if not self.drag:
             return None
         drag = self.drag
         self.drag = None
         if drag.active:
-            remaining_units = [unit for unit in self.units if unit.uid != drag.unit.uid]
-            dragged_ids = set(drag.unit.page_ids)
+            dragged_ids = set(drag.page_ids)
+            remaining_units = [unit for unit in self.units if not set(unit.page_ids).issubset(dragged_ids)]
             dragged_pages = [page for page in self.pages if page.uid in dragged_ids]
             remaining_pages = [page for page in self.pages if page.uid not in dragged_ids]
             if drag.insert_index >= len(remaining_units):
@@ -1104,20 +1425,74 @@ class PdfMergerApp:
             else:
                 anchor_id = remaining_units[drag.insert_index].page_ids[0]
                 insert_at = next(index for index, page in enumerate(remaining_pages) if page.uid == anchor_id)
-            self.pages = remaining_pages[:insert_at] + dragged_pages + remaining_pages[insert_at:]
-            self._set_status(f"已移动 {len(dragged_pages)} 页。")
+            reordered = remaining_pages[:insert_at] + dragged_pages + remaining_pages[insert_at:]
+            if reordered != self.pages:
+                self._record_undo()
+                self.pages = reordered
+                self.selected_page_ids = [page.uid for page in dragged_pages]
+                self.selection_anchor_id = self.selected_page_ids[-1] if self.selected_page_ids else None
+                self._set_status(f"已移动 {len(dragged_pages)} 页。")
+        elif drag.collapse_on_release:
+            self.selected_page_ids = list(drag.unit.page_ids)
+            self.selection_anchor_id = drag.unit.page_ids[0]
         self._schedule_draw()
         return "break"
+
+    def _select_unit_with_modifiers(self, unit: LayoutUnit, state: int) -> None:
+        ctrl = bool(state & 0x0004)
+        shift = bool(state & 0x0001)
+        if shift and self.selection_anchor_id:
+            anchor_index = next(
+                (index for index, item in enumerate(self.units) if self.selection_anchor_id in item.page_ids),
+                None,
+            )
+            if anchor_index is not None:
+                target_index = self.units.index(unit)
+                start, end = sorted((anchor_index, target_index))
+                range_ids = [page_id for item in self.units[start : end + 1] for page_id in item.page_ids]
+                if ctrl:
+                    existing = list(self.selected_page_ids)
+                    seen = set(existing)
+                    self.selected_page_ids = existing + [page_id for page_id in range_ids if page_id not in seen]
+                else:
+                    self.selected_page_ids = range_ids
+                return
+
+        unit_ids = set(unit.page_ids)
+        selected = list(self.selected_page_ids)
+        selected_set = set(selected)
+        if ctrl:
+            if unit_ids.issubset(selected_set):
+                self.selected_page_ids = [page_id for page_id in selected if page_id not in unit_ids]
+            else:
+                self.selected_page_ids = selected + [page_id for page_id in unit.page_ids if page_id not in selected_set]
+        else:
+            self.selected_page_ids = list(unit.page_ids)
+        self.selection_anchor_id = unit.page_ids[0]
+
+    @staticmethod
+    def _rects_intersect(
+        first: tuple[float, float, float, float],
+        second: tuple[float, float, float, float],
+    ) -> bool:
+        return not (
+            first[2] < second[0]
+            or first[0] > second[2]
+            or first[3] < second[1]
+            or first[1] > second[3]
+        )
 
     def _toggle_unit(self, unit_id: str) -> None:
         unit = self.unit_by_id.get(unit_id)
         if not unit:
             return
+        self._record_undo()
         if unit.source_id in self.expanded_sources:
             self.expanded_sources.remove(unit.source_id)
         else:
             self.expanded_sources.add(unit.source_id)
         self.selected_page_ids.clear()
+        self.selection_anchor_id = None
         self._schedule_draw()
 
     def _delete_unit(self, unit_id: str) -> None:
@@ -1127,23 +1502,72 @@ class PdfMergerApp:
         self.selected_page_ids = list(unit.page_ids)
         self._delete_selected()
 
-    def _delete_selected(self) -> None:
+    def _delete_selected(self, _event: tk.Event | None = None) -> str:
         if self.busy or not self.selected_page_ids:
-            return
+            return "break"
+        self._record_undo()
         deleting = set(self.selected_page_ids)
         count = len(deleting)
         self.pages = [page for page in self.pages if page.uid not in deleting]
-        active_sources = {page.source_id for page in self.pages}
-        removed_sources = [source_id for source_id in self.sources if source_id not in active_sources]
-        for source_id in removed_sources:
-            self.sources.pop(source_id, None)
-            self.expanded_sources.discard(source_id)
-            for key in [key for key in self.thumbnail_images if key[0] == source_id]:
-                self.thumbnail_images.pop(key, None)
         self.selected_page_ids.clear()
+        self.selection_anchor_id = None
         self._set_status(f"已删除 {count} 页。")
         self._update_summary()
         self._schedule_draw()
+        return "break"
+
+    def _show_context_menu(self, event: tk.Event) -> str:
+        if self.busy:
+            return "break"
+        unit = self._unit_at(self.workspace.canvasx(event.x), self.workspace.canvasy(event.y))
+        if unit and not set(unit.page_ids).issubset(self.selected_page_ids):
+            self.selected_page_ids = list(unit.page_ids)
+            self.selection_anchor_id = unit.page_ids[0]
+            self._schedule_draw()
+
+        c = self.colors
+        menu = tk.Menu(
+            self.root,
+            tearoff=False,
+            bg=c["surface"],
+            fg=c["text"],
+            activebackground=c["accent"],
+            activeforeground="white",
+            borderwidth=1,
+        )
+        has_selection = bool(self.selected_page_ids)
+        self._add_context_command(menu, "复制    Ctrl+C", self._copy_selected, has_selection)
+        self._add_context_command(menu, "剪切    Ctrl+X", self._cut_selected, has_selection)
+        self._add_context_command(menu, "粘贴    Ctrl+V", self._paste_pages, bool(self.clipboard_pages))
+        menu.add_separator()
+        self._add_context_command(menu, "全选    Ctrl+A", self._select_all, bool(self.pages))
+        self._add_context_command(menu, "删除    Delete", self._delete_selected, has_selection)
+        menu.add_separator()
+        self._add_context_command(menu, "撤销    Ctrl+Z", self._undo, bool(self.undo_stack))
+        self._add_context_command(menu, "重做    Ctrl+Y", self._redo, bool(self.redo_stack))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+            menu.destroy()
+        return "break"
+
+    def _add_context_command(self, menu: tk.Menu, label: str, command, enabled: bool) -> None:
+        if enabled:
+            menu.add_command(label=label, command=command)
+            return
+
+        # Tk renders entries in the native "disabled" state with an embossed
+        # highlight on Windows.  A normal no-op entry gives us direct control
+        # over the foreground colour and therefore a flat, readable grey.
+        c = self.colors
+        menu.add_command(
+            label=label,
+            command=lambda: None,
+            foreground=c["disabled"],
+            activeforeground=c["disabled"],
+            activebackground=c["surface"],
+        )
 
     def _unit_at(self, x: float, y: float) -> LayoutUnit | None:
         for unit in self.units:
@@ -1205,7 +1629,12 @@ class PdfMergerApp:
         if self.pending_conversions:
             messagebox.showinfo("文档仍在转换", "请等待 Word 文档预览生成完成。", parent=self.root)
             return
-        failed = [source.path.name for source in self.sources.values() if source.error]
+        active_source_ids = {page.source_id for page in self.pages}
+        failed = [
+            self.sources[source_id].path.name
+            for source_id in active_source_ids
+            if self.sources[source_id].error
+        ]
         if failed:
             messagebox.showerror("存在转换失败的文件", "请先删除或重新添加：\n" + "\n".join(failed), parent=self.root)
             return
